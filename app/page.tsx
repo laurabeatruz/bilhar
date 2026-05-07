@@ -40,7 +40,7 @@ export default function Home() {
   const isShootingRef = useRef(false)
 
   function joinQueue() {
- const socket = io('https://audit-combinations-milan-casio.trycloudflare.com')
+  const socket = io('https://bilhar-production.up.railway.app')
 
     socket.on('connect', () => {
       socket.emit('join_queue', { betAmount: 20 })
