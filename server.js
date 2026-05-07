@@ -1,0 +1,288 @@
+const { createServer } = require('http')
+const { Server } = require('socket.io')
+const Matter = require('matter-js')
+
+const { Engine, Bodies, Body, World } = Matter
+
+const httpServer = createServer()
+const io = new Server(httpServer, {
+  cors: { origin: 'http://localhost:3000', methods: ['GET', 'POST'] },
+})
+
+const W = 880
+const H = 480
+const BALL_R = 13
+const rooms = {}
+
+function createPhysicsRoom() {
+  const engine = Engine.create({
+    gravity: { x: 0, y: 0 },
+    positionIterations: 10,
+    velocityIterations: 10,
+  })
+  const world = engine.world
+
+  const wallOpts = { isStatic: true, label: 'wall', friction: 0, restitution: 0.9 }
+  World.add(world, [
+    Bodies.rectangle(W / 2, -25, W + 100, 60, wallOpts),
+    Bodies.rectangle(W / 2, H + 25, W + 100, 60, wallOpts),
+    Bodies.rectangle(-25, H / 2, 60, H + 100, wallOpts),
+    Bodies.rectangle(W + 25, H / 2, 60, H + 100, wallOpts),
+  ])
+
+  const bx = 620
+  const by = H / 2
+  const sp = BALL_R * 2 + 1
+
+  const positions = [
+    { x: bx, y: by },
+    { x: bx + sp, y: by - BALL_R },
+    { x: bx + sp, y: by + BALL_R },
+    { x: bx + sp * 2, y: by - BALL_R * 2 },
+    { x: bx + sp * 2, y: by },
+    { x: bx + sp * 2, y: by + BALL_R * 2 },
+    { x: bx + sp * 3, y: by - BALL_R * 3 },
+    { x: bx + sp * 3, y: by - BALL_R },
+    { x: bx + sp * 3, y: by + BALL_R },
+    { x: bx + sp * 3, y: by + BALL_R * 3 },
+  ]
+
+  const ballOpts = { restitution: 0.85, friction: 0.005, frictionAir: 0.025, density: 0.002 }
+
+  const coloredBalls = positions.map((pos, i) =>
+    Bodies.circle(pos.x, pos.y, BALL_R, { ...ballOpts, label: `ball_${i}` })
+  )
+
+  const cueBall = Bodies.circle(220, H / 2, BALL_R, { ...ballOpts, label: 'cue' })
+
+  World.add(world, [...coloredBalls, cueBall])
+
+  const pockets = [
+    { x: 30, y: 30 }, { x: W / 2, y: 18 }, { x: W - 30, y: 30 },
+    { x: 30, y: H - 30 }, { x: W / 2, y: H - 18 }, { x: W - 30, y: H - 30 },
+  ]
+
+  return { engine, world, cueBall, coloredBalls, pockets, pocketedBalls: [] }
+}
+
+function getGameState(room) {
+  const { cueBall, coloredBalls, pocketedBalls } = room.physics
+  return {
+    cueBall: {
+      x: Math.round(cueBall.position.x * 10) / 10,
+      y: Math.round(cueBall.position.y * 10) / 10,
+    },
+    balls: coloredBalls
+      .filter(b => !pocketedBalls.includes(b.id))
+      .map(b => ({
+        id: b.id,
+        label: b.label,
+        x: Math.round(b.position.x * 10) / 10,
+        y: Math.round(b.position.y * 10) / 10,
+      })),
+  }
+}
+
+function allStopped(room) {
+  const { cueBall, coloredBalls } = room.physics
+  return [cueBall, ...coloredBalls].every(b =>
+    Math.abs(b.velocity.x) < 0.1 && Math.abs(b.velocity.y) < 0.1
+  )
+}
+
+function endGame(roomId, loop, winner, reason) {
+  io.to(roomId).emit('game_over', { winner, reason })
+  clearInterval(loop)
+  delete rooms[roomId]
+  console.log(`Jogo encerrado! Vencedor: ${winner} — motivo: ${reason}`)
+}
+
+function startPhysicsLoop(roomId) {
+  const room = rooms[roomId]
+  if (!room) return
+
+  const loop = setInterval(() => {
+    if (!rooms[roomId]) {
+      clearInterval(loop)
+      return
+    }
+
+    Engine.update(room.physics.engine, 1000 / 60)
+
+    const { coloredBalls, cueBall, pockets, pocketedBalls } = room.physics
+    let gameEnded = false
+
+    // Verificar bolas nas caçapas
+    for (const ball of coloredBalls) {
+      if (gameEnded) break
+      if (pocketedBalls.includes(ball.id)) continue
+
+      for (const pocket of pockets) {
+        if (gameEnded) break
+        const dx = ball.position.x - pocket.x
+        const dy = ball.position.y - pocket.y
+        if (Math.sqrt(dx * dx + dy * dy) < 22) {
+          pocketedBalls.push(ball.id)
+          Body.setPosition(ball, { x: -200, y: -200 })
+          Body.setVelocity(ball, { x: 0, y: 0 })
+
+          if (ball.label === 'ball_4') {
+            // Bola preta encaçapada
+            gameEnded = true
+            const restantes = coloredBalls.filter(b =>
+              b.label !== 'ball_4' && !pocketedBalls.includes(b.id)
+            )
+            if (restantes.length > 0) {
+              // Encaçapou antes da hora — perde
+              const loser = room.lastShooter
+              const winner = room.players.find(p => p !== loser)
+              endGame(roomId, loop, winner, 'black_early')
+            } else {
+              // Todas as bolas foram — venceu!
+              endGame(roomId, loop, room.lastShooter, 'black_win')
+            }
+            break
+          }
+
+         // Bola normal encaçapada
+          room.ballPocketedThisTurn = true
+          console.log(`ballPocketedThisTurn setado para TRUE — bola: ${ball.label}`)
+          io.to(roomId).emit('ball_pocketed', {
+            ballId: ball.id,
+            label: ball.label,
+            scoredBy: room.lastShooter,
+          })
+          console.log(`Bola ${ball.label} encaçapada por ${room.lastShooter}`)
+        }
+      }
+    }
+
+    if (gameEnded) return
+
+    // Bola branca encaçapada — reposicionar
+    for (const pocket of pockets) {
+      const dx = cueBall.position.x - pocket.x
+      const dy = cueBall.position.y - pocket.y
+      if (Math.sqrt(dx * dx + dy * dy) < 22) {
+        Body.setPosition(cueBall, { x: 220, y: H / 2 })
+        Body.setVelocity(cueBall, { x: 0, y: 0 })
+        io.to(roomId).emit('cue_ball_pocketed')
+        break
+      }
+    }
+
+    // Enviar estado
+    io.to(roomId).emit('state_update', getGameState(room))
+
+    // Verificar fim de turno
+    if (room.waitingForStop && allStopped(room)) {
+      room.waitingForStop = false
+
+      if (room.ballPocketedThisTurn) {
+        room.ballPocketedThisTurn = false
+        io.to(roomId).emit('turn_change', { currentTurn: room.currentTurn })
+        console.log(`${room.currentTurn} continua jogando!`)
+      } else {
+        const other = room.players.find(p => p !== room.currentTurn)
+        room.currentTurn = other
+        io.to(roomId).emit('turn_change', { currentTurn: other })
+        console.log(`Vez de ${other}`)
+      }
+    }
+  }, 1000 / 60)
+
+  room.physicsLoop = loop
+}
+
+io.on('connection', (socket) => {
+  console.log('Conectado:', socket.id)
+
+  socket.on('join_queue', ({ betAmount }) => {
+    let roomFound = null
+    for (const roomId in rooms) {
+      const room = rooms[roomId]
+      if (room.betAmount === betAmount && room.players.length === 1) {
+        roomFound = roomId
+        break
+      }
+    }
+
+    if (roomFound) {
+      rooms[roomFound].players.push(socket.id)
+      socket.join(roomFound)
+      const room = rooms[roomFound]
+      io.to(roomFound).emit('match_found', {
+        roomId: roomFound,
+        players: room.players,
+        currentTurn: room.players[0],
+        initialState: getGameState(room),
+      })
+      startPhysicsLoop(roomFound)
+      console.log(`Partida iniciada: ${roomFound}`)
+    } else {
+      const roomId = `sala_${Date.now()}`
+      rooms[roomId] = {
+        id: roomId,
+        betAmount,
+        players: [socket.id],
+        currentTurn: socket.id,
+        physics: createPhysicsRoom(),
+        waitingForStop: false,
+        ballPocketedThisTurn: false,
+        lastShooter: null,
+      }
+      socket.join(roomId)
+      socket.emit('waiting', { roomId })
+      console.log(`Sala criada: ${roomId}`)
+    }
+  })
+
+  socket.on('shot', ({ roomId, px, py }) => {
+    const room = rooms[roomId]
+    if (!room) return
+    if (room.currentTurn !== socket.id) return
+    if (room.waitingForStop) return
+
+    const { cueBall } = room.physics
+    const cx = cueBall.position.x
+    const cy = cueBall.position.y
+    const dx = cx - px
+    const dy = cy - py
+    const dist = Math.sqrt(dx * dx + dy * dy)
+    if (dist === 0) return
+
+    const power = Math.min(dist / 7, 40)
+    const nx = (dx / dist) * power
+    const ny = (dy / dist) * power
+
+    const maxSpeed = 25
+    const speed = Math.sqrt(nx * nx + ny * ny)
+    const vx = speed > maxSpeed ? (nx / speed) * maxSpeed : nx
+    const vy = speed > maxSpeed ? (ny / speed) * maxSpeed : ny
+
+    Body.setVelocity(cueBall, { x: vx, y: vy })
+    room.waitingForStop = true
+    room.lastShooter = socket.id
+    room.ballPocketedThisTurn = false
+
+   console.log(`Taco de ${socket.id} — força: ${speed.toFixed(1)}`)
+    console.log(`waitingForStop: ${room.waitingForStop}, ballPocketedThisTurn: ${room.ballPocketedThisTurn}`)
+  })
+
+  socket.on('disconnect', () => {
+    console.log('Desconectado:', socket.id)
+    for (const roomId in rooms) {
+      const room = rooms[roomId]
+      if (room.players.includes(socket.id)) {
+        clearInterval(room.physicsLoop)
+        socket.to(roomId).emit('opponent_disconnected')
+        delete rooms[roomId]
+        break
+      }
+    }
+  })
+})
+
+httpServer.listen(3001, '0.0.0.0', () => {
+  console.log('Servidor rodando na porta 3001')
+})
