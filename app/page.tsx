@@ -40,7 +40,10 @@ export default function Home() {
   const isShootingRef = useRef(false)
 
   function joinQueue() {
-  const socket = io('https://bilhar-production.up.railway.app')
+  const socket = io('https://bilhar-production.up.railway.app', {
+  path: '/socket.io',
+  transports: ['websocket', 'polling']
+})
 
     socket.on('connect', () => {
       socket.emit('join_queue', { betAmount: 20 })
