@@ -3,3 +3,6 @@ builder = "nixpacks"
 
 [deploy]
 startCommand = "node server.js"
+
+[variables]
+NODE_VERSION = "20"
